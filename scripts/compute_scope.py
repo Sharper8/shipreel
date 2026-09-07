@@ -92,13 +92,18 @@ def changed_files(base: str, head: str) -> list[str]:
     if set(base) == {"0"}:
         base = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
     out = subprocess.run(
-        ["git", "diff", "--name-only", base, head],
+        # Three-dot: diff from the merge-base — the PR's own changes, matching
+        # GitHub's "Files changed". Two-dot would pick up unrelated base-branch
+        # movement as reverse-diffs and over-trigger FULL.
+        ["git", "diff", "--name-only", f"{base}...{head}"],
         check=True, capture_output=True, text=True,
     )
     return [f for f in out.stdout.splitlines() if f.strip()]
 
 
 def compute(base: str, head: str, config_path: str = "shipreel.yaml") -> str:
+    if not base.strip() or not head.strip():
+        return "FULL"  # e.g. manual dispatch without event SHAs
     cfg = load_config(Path(config_path))
     watch: dict[str, list[str]] = cfg.get("watch", {})
     ignore: list[str] = cfg.get("ignore", [])
