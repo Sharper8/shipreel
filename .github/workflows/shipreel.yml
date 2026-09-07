@@ -1,13 +1,13 @@
 name: ShipReel
 
-# Reusable workflow: records a demo video of the app on the PR head (and on the
-# base branch, for before/after), publishes mp4s to a rolling release in the
-# CALLING repo, and upserts a sticky PR comment with the links.
+# Reusable workflow: records a demo video of the app on the change head (and on
+# the base, for before/after), publishes mp4s to a rolling release in the
+# CALLING repo, and upserts a sticky comment with the links — on the PR for
+# pull_request events, on the commit for push events (trunk-based flow).
 #
-# Contract: the caller's walkthrough command drives a real browser through the
-# app, drops one or more .webm recordings into <video-dir>, and exits non-zero
-# if any screen raised. ShipReel owns everything else (conversion, publishing,
-# commenting). See README.md.
+# Diff-scoped: if the calling repo has a shipreel.yaml watch-map, only the
+# surfaces affected by the diff are recorded (SKIP = no user-facing change, no
+# video at all). See README.md.
 
 on:
   workflow_call:
@@ -17,7 +17,7 @@ on:
         required: true
         type: string
       walkthrough-command:
-        description: "Shell command that runs the walkthrough; must drop .webm files into <video-dir> and exit non-zero on failure"
+        description: "Shell command that runs the walkthrough; must drop .webm files into <video-dir> and exit non-zero on failure. Receives SHIPREEL_SCOPES (comma-separated surfaces, empty = full)."
         required: true
         type: string
       video-dir:
@@ -25,7 +25,7 @@ on:
         default: "e2e/videos"
         type: string
       before-after:
-        description: "Also record the walkthrough on the PR base branch and post before/after + side-by-side videos"
+        description: "Also record the walkthrough on the base ref and post before/after + side-by-side videos"
         default: true
         type: boolean
       release-tag:
@@ -37,6 +37,10 @@ on:
         default: "3.11"
         type: string
 
+env:
+  BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+  HEAD: ${{ github.event.pull_request.head.sha || github.event.after || github.sha }}
+
 jobs:
   shipreel:
     runs-on: ubuntu-latest
@@ -45,20 +49,42 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Fetch ShipReel scripts
+        uses: actions/checkout@v4
+        with:
+          repository: Sharper8/shipreel
+          ref: main
+          path: .shipreel
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
 
+      - name: Compute walkthrough scope (shipreel.yaml watch-map)
+        id: scope
+        run: |
+          result=$(python3 .shipreel/scripts/compute_scope.py "$BASE" "$HEAD")
+          echo "scopes=$result" >> "$GITHUB_OUTPUT"
+          if [ "$result" = "FULL" ] || [ "$result" = "SKIP" ]; then
+            echo "scopes_env=" >> "$GITHUB_OUTPUT"
+          else
+            echo "scopes_env=$result" >> "$GITHUB_OUTPUT"
+          fi
+          echo "computed scope: $result"
+
       - name: Setup (caller-provided)
+        if: steps.scope.outputs.scopes != 'SKIP'
         run: ${{ inputs.setup-command }}
 
       - name: Install ffmpeg
+        if: steps.scope.outputs.scopes != 'SKIP'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
 
-      - name: Record AFTER video (PR head)
-        id: after
+      - name: Record AFTER video (change head)
+        if: steps.scope.outputs.scopes != 'SKIP'
         env:
           VIDEO_DIR: ${{ inputs.video-dir }}
+          SHIPREEL_SCOPES: ${{ steps.scope.outputs.scopes_env }}
         run: |
           mkdir -p shipreel-out
           rm -rf "$VIDEO_DIR" && mkdir -p "$VIDEO_DIR"
@@ -67,20 +93,19 @@ jobs:
           ffmpeg -y -i "$src" -c:v libx264 -pix_fmt yuv420p -movflags +faststart shipreel-out/after.mp4
           ffmpeg -y -i shipreel-out/after.mp4 -vf "fps=10,scale=720:-1:flags=lanczos" shipreel-out/after.gif
 
-      - name: Record BEFORE video (base branch)
-        if: inputs.before-after && github.event_name == 'pull_request'
+      - name: Record BEFORE video (base ref)
+        if: inputs.before-after && steps.scope.outputs.scopes != 'SKIP'
         id: before
-        continue-on-error: true  # a broken base must not block the PR
+        continue-on-error: true  # a broken base must not block the change
         env:
           VIDEO_DIR: ${{ inputs.video-dir }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SHIPREEL_SCOPES: ${{ steps.scope.outputs.scopes_env }}
         run: |
           git config user.email shipreel@local && git config user.name shipreel
-          # Base app code, but the walkthrough harness from the PR head
+          # Base app code, but the walkthrough harness from the head
           # (the harness may not exist on base yet).
-          git checkout -q "$BASE_SHA"
-          git checkout -q "$HEAD_SHA" -- e2e/ 2>/dev/null || true
+          git checkout -q "$BASE"
+          git checkout -q "$HEAD" -- e2e/ 2>/dev/null || true
           rm -rf "$VIDEO_DIR" && mkdir -p "$VIDEO_DIR"
           ${{ inputs.walkthrough-command }}
           src=$(ls "$VIDEO_DIR"/*.webm | head -1)
@@ -106,50 +131,71 @@ jobs:
           retention-days: 14
 
       - name: Publish videos to rolling release
-        if: success() && github.event_name == 'pull_request'
+        if: success() && steps.scope.outputs.scopes != 'SKIP'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
           TAG: ${{ inputs.release-tag }}
         run: |
+          KEY="${{ github.event.pull_request.number || github.sha }}"
+          PREFIX="pr-${KEY}"
+          [ "${{ github.event_name }}" = "push" ] && PREFIX="push-${GITHUB_SHA:0:8}"
+          echo "PREFIX=$PREFIX" >> "$GITHUB_ENV"
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" --target "${{ github.event.repository.default_branch }}" \
               --title "ShipReel videos (rolling)" \
-              --notes "Auto-generated PR demo videos. Assets are overwritten per PR — always the latest run."
+              --notes "Auto-generated demo videos. Assets are overwritten per change — always the latest run."
           for f in shipreel-out/*.mp4 shipreel-out/*.gif; do
             [ -e "$f" ] || continue
-            staged="/tmp/pr-${PR_NUMBER}-$(basename "$f")"
+            staged="/tmp/${PREFIX}-$(basename "$f")"
             cp "$f" "$staged"
             gh release upload "$TAG" "$staged" --clobber
           done
 
-      - name: Upsert PR comment
-        if: always() && github.event_name == 'pull_request'
+      - name: Upsert comment (PR or commit)
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
           JOB_STATUS: ${{ job.status }}
           TAG: ${{ inputs.release-tag }}
+          SCOPES: ${{ steps.scope.outputs.scopes }}
           HAS_BEFORE: ${{ steps.before.outcome }}
         run: |
           MARKER="<!-- shipreel -->"
           BASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
-          if [ "$JOB_STATUS" = "success" ]; then
-            LINES="✅ Walkthrough passed — no screen raised."
+          KEY="${{ github.event.pull_request.number || github.sha }}"
+          PREFIX="pr-${KEY}"
+          [ "${{ github.event_name }}" = "push" ] && PREFIX="push-${GITHUB_SHA:0:8}"
+
+          case "$SCOPES" in
+            FULL) SCOPE_LINE="Full walkthrough (shared or unmapped files changed)." ;;
+            SKIP) SCOPE_LINE="" ;;
+            *) SCOPE_LINE="Scoped to: **${SCOPES}** (diff-scoped capture)." ;;
+          esac
+
+          if [ "$SCOPES" = "SKIP" ]; then
+            LINES="No user-facing changes in this diff — nothing to record. ⏭"
+          elif [ "$JOB_STATUS" = "success" ]; then
+            LINES="✅ Walkthrough passed — no screen raised.\n\n${SCOPE_LINE}"
             [ -f "shipreel-out/combined.mp4" ] && \
-              LINES="${LINES}\n\n**⏯ Before/after side-by-side:** ${BASE_URL}/pr-${PR_NUMBER}-combined.mp4"
-            LINES="${LINES}\n\n**After (this PR):** ${BASE_URL}/pr-${PR_NUMBER}-after.mp4"
+              LINES="${LINES}\n\n**⏯ Before/after side-by-side:** ${BASE_URL}/${PREFIX}-combined.mp4"
+            LINES="${LINES}\n\n**After (this change):** ${BASE_URL}/${PREFIX}-after.mp4"
             [ "$HAS_BEFORE" = "success" ] && \
-              LINES="${LINES}\n**Before (base):** ${BASE_URL}/pr-${PR_NUMBER}-before.mp4"
+              LINES="${LINES}\n**Before (base):** ${BASE_URL}/${PREFIX}-before.mp4"
           else
-            LINES="🔴 Walkthrough FAILED — recording up to the failure + \`FAILURE-<screen>.png\` screenshot are in the run artifacts (\`shipreel\`)."
+            LINES="🔴 Walkthrough FAILED — recording up to the failure + a \`FAILURE-<screen>.png\` screenshot are in the run artifacts (\`shipreel\`)."
           fi
-          BODY=$(printf "%b\n🎬 **ShipReel — PR demo video**\n\n%b\n" "$MARKER" "$LINES")
-          existing=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-            --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -1)
-          if [ -n "$existing" ]; then
-            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -f body="$BODY" >/dev/null
+          BODY=$(printf "%b\n🎬 **ShipReel — demo video**\n\n%b\n" "$MARKER" "$LINES")
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            existing=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${KEY}/comments" \
+              --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -1)
+            if [ -n "$existing" ]; then
+              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -f body="$BODY" >/dev/null
+            else
+              gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${KEY}/comments" -f body="$BODY" >/dev/null
+            fi
           else
-            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$BODY" >/dev/null
+            # push → comment on the head commit
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/commits/${{ github.sha }}/comments" -f body="$BODY" >/dev/null
           fi
-          echo "comment upserted"
+          echo "comment posted"
